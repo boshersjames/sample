@@ -1,0 +1,196 @@
+from flask import Flask, request, redirect
+from twilio.twiml.messaging_response import MessagingResponse
+from oauth2client.service_account import ServiceAccountCredentials
+import gspread
+from gspread_dataframe import get_as_dataframe, set_with_dataframe
+import requests
+from google.cloud import secretmanager
+from requests.auth import HTTPBasicAuth
+from twilio.rest import Client
+from werkzeug.utils import secure_filename
+from shapely.geometry import shape, Point, Polygon
+import pytz
+import io
+import time
+from gcloud import storage
+import pandas as pd
+import json
+import math
+import re
+import datetime
+import requests
+
+app = Flask(__name__)
+@app.route("/sms", methods=['GET', 'POST'])
+def San_Corral_Audit(request):
+    try:
+        resp = MessagingResponse()                  # Set up a response Variable
+        body = str(request.values.get('Body',None)) # Text 
+        body = body.strip()                        # Remove Trailing / Leading Spaces
+        user = str(request.values.get('From',None)) # From Phone Number
+        sid = str(request.values.get('MessageSid',None))   # Specific Message ID
+        photo = sid[:2] # Check for photo         
+        pst = pytz.timezone('America/Los_Angeles')  # 
+        Dt = datetime.datetime.now()                # Current Time
+
+        CurrentTime = Dt.astimezone(pst).strftime('%m-%d_%H:%M') # Timestamp as string
+        client = CreateGClient()                # Google Client
+        Wb = client.open('SampleWorkbook')     # Google Workbook *Proxy for DB
+        Users = ['+17049893509','+16103507595','+18582318918','+14154647888','+16192532392','+16195365852']
+
+        ACCOUNT_SID = get_secret('TWILIO_SID')
+        AUTH_TOKEN = get_secret('TWILIO_TOKEN')
+        client = Client(ACCOUNT_SID, AUTH_TOKEN)
+
+        if photo == "MM" and user in Users:
+            Ws = Wb.worksheet('All_Corrals')      # This is the WorkSheet Used for Parking
+            df = get_as_dataframe(Ws)             # Download the WS as a dataframe
+            Corral = body.split('!')[0].strip()
+            Corrals = Ws.col_values(1)
+            if Corral in Corrals or Corral.lower() == 'new':
+                # Get formatted information from the text message
+                CityCorral = body.split('!')[1].strip()
+                side = body.split('!')[2].strip()
+                size = body.split('!')[3].strip()
+                Coords = body.split('!')[4].strip()
+
+
+                
+                url = ProccessMMS(client,sid,Corral,CurrentTime,AUTH_TOKEN,ACCOUNT_SID)
+                df = ChangeCorralStatus(df,Corral,CityCorral,side,size, url,user,Coords, CurrentTime)
+                set_with_dataframe(Ws,df)
+                resp.message("Corral Saved")
+        else:
+            resp.message("No Photo or you are not an Authorized Auditor!") # Phone Number Not Found in Active Users
+        return str(resp) # Send Response
+      
+    except Exception as e:
+        resp.message("ERROR " + str(e))
+        return str(resp) # An Error Occured 
+
+def next_available_row(col,worksheet):
+    str_list = worksheet.col_values(col)
+    return len(str_list)+1 
+
+def ProccessMMS(client,sid,Corral,CurrentTime,TOK,ASID):
+    try: 
+        photo_url=''
+        photo = io.BytesIO()
+        BASE_URL = "https://api.twilio.com"
+        medias = client.messages(sid).media.list()
+        for media in medias:
+            media_instance = client.messages(sid).media(media.sid).fetch()
+            url = BASE_URL + media_instance.uri
+            url = url.replace('.json','')
+            Name =  Corral + '_' + sid + '_' + media.sid + '.jpg'
+            blob = UpdateBucket(Name)
+            r = requests.get(url,auth=HTTPBasicAuth(ASID,TOK),allow_redirects=True,stream=True)
+            if r.status_code==200:
+                for chunk in r.iter_content(chunk_size=8192): 
+                    if chunk: # filter out keep-alive new chunks
+                        photo.write(chunk)
+                photo = photo.getvalue()
+                blob.upload_from_string(photo,content_type='image/jpg')
+                blob.make_public()
+                photo_url = blob.public_url
+        return photo_url
+    except Exception as e:
+        return str(e)
+def UpdateBucket(Name):
+    try:
+        Google_Key = get_secret("GOOGLE_API_KEY")
+        creds = ServiceAccountCredentials.get_access_token(Google_Key)      
+        storage_client = storage.Client(credentials=creds,project='My First Project')
+        bucket = storage_client.get_bucket('corral_photos')
+        blob = bucket.blob(Name,chunk_size=262144)
+        return blob
+
+    except Exception as e:
+        return str(e)
+def ChangeCorralStatus(df,Corral,cityname,side, size,url,user,Coords,CurrentTime):
+    lat = ''
+    lng = ''
+    neigh = ''
+    UserDict = {'phone_number':'User_name'}
+    Username = UserDict.get(user)          # Google Maps Pin
+    lat = Coords.split(',')[0].replace('(','')      #Lat from pin
+    lng = Coords.split(',')[1].replace(')','')      #Lng from pin
+    ServiceArea_url = 'Link to Updated Service Area with Neighborhoods'
+    response = requests.get(ServiceArea_url)
+    if response.status_code ==200:
+        ServiceArea = response.json()
+    else:
+        ServiceArea = {'No Response';'Url Failed'}
+
+    if Corral.lower() =='new':
+        neighborhood = FindServiceArea(float(lat),float(lng),ServiceArea)  # Find the Neighborhood they are inAdd new record information
+        df = df.append({'Corral_ID': Corral + str(df.shape[0]+1),'city_corral':cityname,'Neighborhood':neighborhood,'new_side': side, 'Size':size,'Auditor':Username,'DS': CurrentTime,'URL':url,'new_lat':lat,'new_lng':lng},ignore_index=True)                 # Update Corral data if iit already exists
+
+    else:
+        index = df.loc[df['Corral_ID']==Corral].index[0]
+        df.loc[index, 'new_lat'] = str(lat)
+        df.loc[index, 'new_lng'] = str(lng)
+        df.loc[index, 'new_lng'] = str(lng)
+        df.loc[index, 'new_side'] = str(side)
+        df.loc[index, 'size'] = str(size)
+        df.loc[index, 'url'] = str(url)
+        df.loc[index, 'ds'] = CurrentTime
+        df.loc[index, 'Auditor'] = Username
+        df.loc[index, 'city_corral'] = cityname
+
+        
+
+    return df
+def get_secret(secret_name):
+    client = secretmanager.SecretManagerServiceClient()
+    project_id = "enduring-lane-255318"  # Replace with your project ID
+    name = f"projects/{project_id}/secrets/{secret_name}/versions/latest"
+    response = client.access_secret_version(name=name)
+    return response.payload.data.decode("UTF-8")
+
+
+def FindServiceArea(Lat,Lng, Service_Area): 
+  
+    point = Point(Lng, Lat)
+    Found = False
+    if Service_Area == {'No Response';'Url Failed'}:
+        return 'Area Not Found'
+    else:
+        for feature in Service_Area['features']:     
+            polygon = shape(feature['geometry'])
+            if polygon.contains(point):
+                Found = True
+                return feature['properties']['name']
+                break
+        if Found==False:
+            return 'OutofArea'        
+    
+def CreateGClient():
+
+    Google_Key = get_secret('GOOGLE_API_KEY')
+    creds = ServiceAccountCredentials.get_access_token(Google_Key)
+    client = gspread.authorize(creds)
+    return client   
+
+def SendTxtMessage(client,PhoneNum,MSG,From):
+    PhoneNum = '+' + str(PhoneNum)
+    message = client.messages.create(to= PhoneNum, from_= From,body= MSG)
+    if message.error_code==30007 or message.error_code=='30007':
+        return False
+    else:
+        return True   
+    
+def CalcDistance(Lat1, Lat2, Lng1, Lng2):
+    dlon = math.radians(Lng2 - Lng1)
+    dlat = math.radians(Lat2 - Lat1)
+    a = math.sin(dlat/2)**2 + math.cos(Lat1) * math.cos(Lat2) * math.sin(dlon/2)**2
+    c = 2 * math.asin(math.sqrt(a))
+    distance = (3959.84 * c)*5280
+    if math.isnan(distance):
+        return 99999
+   
+    else:
+        return distance
+
+if __name__ == "__main__":
+    app.run(debug=True)
